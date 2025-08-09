@@ -408,13 +408,17 @@ class NetworkMonitorV3:
                     
                     # 不需要单独处理VPN设备，在连接处理中已经处理了
                     
-                    # 计算接口流量变化
-                    total_period_traffic = 0
+                    # 计算接口流量变化 - 分别统计上行和下行
+                    total_period_traffic_in = 0
+                    total_period_traffic_out = 0
                     for interface, stats in interface_stats.items():
                         if interface in last_interface_stats:
                             bytes_in_diff = max(0, stats['bytes_in'] - last_interface_stats[interface]['bytes_in'])
                             bytes_out_diff = max(0, stats['bytes_out'] - last_interface_stats[interface]['bytes_out'])
-                            total_period_traffic += bytes_in_diff + bytes_out_diff
+                            total_period_traffic_in += bytes_in_diff
+                            total_period_traffic_out += bytes_out_diff
+                    
+                    total_period_traffic = total_period_traffic_in + total_period_traffic_out
                     
                     # 初始化主要设备（确保VPN设备被创建）
                     vpn_connections = [conn for conn in connections if conn['local_ip'].startswith('28.0.0.')]
@@ -541,7 +545,6 @@ class NetworkMonitorV3:
                         
                         # 网站流量累计 - 按设备分组的改进分配算法
                         if total_period_traffic > 0:
-                            import random
                             
                             # 为每个设备的每个网站单独计算流量
                             for website_name, connected_devices in domain_connections.items():
@@ -552,33 +555,40 @@ class NetworkMonitorV3:
                                         site_stats = self.domain_stats[device_key][website_name]
                                         ip_count = len(site_stats['ips'])
                                         
-                                        # 基于连接数和IP数量的权重计算
-                                        base_weight = (1.0 / len(connected_devices)) * (0.7 + ip_count * 0.3)
+                                        # 基于实际连接活跃度的动态权重计算
+                                        connection_activity = connection_count  # 该网站的连接数
+                                        ip_diversity = len(site_stats['ips'])  # IP多样性
                                         
-                                        # 根据服务类型调整权重
-                                        service_weights = {
-                                            '阿里云': 1.5, '腾讯云': 1.4, 'Amazon': 1.8,
-                                            'Google': 1.6, 'YouTube': 3.0, 'Telegram': 1.2, 
-                                            'Apple': 1.3, 'Akamai CDN': 2.0, 'DigitalOcean': 1.1
-                                        }
+                                        # 权重完全基于观测到的网络活跃度
+                                        # 连接数越多 = 使用越活跃 = 流量越大
+                                        total_domain_connections = sum(len(devices) for devices in domain_connections.values())
+                                        if total_domain_connections > 0:
+                                            activity_weight = connection_activity / total_domain_connections
+                                        else:
+                                            activity_weight = 1.0 / len(connected_devices)  # 平均分配
                                         
-                                        category = site_stats.get('category', '')
-                                        service_weight = service_weights.get(category, 1.0)
+                                        # IP多样性加权：多IP的服务通常是CDN，流量更大
+                                        diversity_bonus = min(1.0 + (ip_diversity - 1) * 0.1, 2.0)  # 最多2倍加权
                                         
-                                        # 计算该网站的流量增量（添加随机化避免相同值）
-                                        traffic_weight = base_weight * service_weight
-                                        random_factor = random.uniform(0.7, 1.3)  # 30%的随机变化
+                                        # 最终权重：活跃度 × IP多样性 × 设备分配权重
+                                        base_weight = (1.0 / len(connected_devices)) * activity_weight * diversity_bonus
                                         
-                                        # 基于总流量的一个合理比例分配
-                                        allocated_traffic = (total_period_traffic * 0.1 * traffic_weight * random_factor)
+                                        # 基于网卡实际上下行流量比例分配
+                                        if total_period_traffic > 0:
+                                            # 使用真实的网卡上下行比例
+                                            actual_down_ratio = total_period_traffic_in / total_period_traffic
+                                            actual_up_ratio = total_period_traffic_out / total_period_traffic
+                                            
+                                            # 按真实比例分配该网站的流量
+                                            allocated_traffic_down = (total_period_traffic_in * 0.1 * base_weight)
+                                            allocated_traffic_up = (total_period_traffic_out * 0.1 * base_weight)
+                                        else:
+                                            allocated_traffic_down = 0
+                                            allocated_traffic_up = 0
                                         
-                                        # 分配上行和下行流量 (下行通常比上行多)
-                                        down_ratio = random.uniform(0.65, 0.85)  # 下行占65-85%
-                                        up_ratio = 1.0 - down_ratio
-                                        
-                                        # 累计网站流量
-                                        self.domain_stats[device_key][website_name]['bytes_down'] += allocated_traffic * down_ratio
-                                        self.domain_stats[device_key][website_name]['bytes_up'] += allocated_traffic * up_ratio
+                                        # 累计网站流量 - 使用网卡真实数据
+                                        self.domain_stats[device_key][website_name]['bytes_down'] += allocated_traffic_down
+                                        self.domain_stats[device_key][website_name]['bytes_up'] += allocated_traffic_up
                                         self.domain_stats[device_key][website_name]['connections'] = connection_count
                     
                     # 计算实时速度 - 分上下行
