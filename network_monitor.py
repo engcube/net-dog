@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-网络流量监控工具 V3
-修复流量统计不一致和设备重复问题
+网络流量监控工具
+智能网络流量实时监控和分析
 """
 
 import subprocess
@@ -14,7 +14,6 @@ from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 import threading
 import socket
-import struct
 
 # 导入增强的域名解析器和GeoSite数据
 from domain_resolver import domain_resolver
@@ -34,7 +33,7 @@ except ImportError:
     print("请安装rich库: pip install rich")
     exit(1)
 
-class NetworkMonitorV3:
+class NetworkMonitor:
     def __init__(self):
         self.console = Console()
         self.data_lock = threading.Lock()
@@ -1400,15 +1399,15 @@ def main():
     console = Console()
     
     console.print(Panel.fit(
-        "🚀 [bold blue]网络流量监控工具 V3[/bold blue]\n"
-        "修复流量统计和设备重复问题\n"
+        "🚀 [bold blue]网络流量监控工具[/bold blue]\n"
+        "智能网络流量实时监控和分析\n"
         "按 [bold red]Ctrl+C[/bold red] 退出",
         style="green"
     ))
     
     console.print("[yellow]注意: 需要管理员权限才能获取完整的网络统计信息[/yellow]\n")
     
-    monitor = NetworkMonitorV3()
+    monitor = NetworkMonitor()
     monitor.start()
 
 if __name__ == "__main__":

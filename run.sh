@@ -11,4 +11,4 @@ fi
 # 激活虚拟环境并运行程序
 echo "🚀 启动网络流量监控工具..."
 source venv/bin/activate
-python3 network_monitor_v3.py
+python3 network_monitor.py
