@@ -399,47 +399,9 @@ class V2RayDatParser:
             
         return None
     
-    def get_domain_category(self, domain: str) -> Optional[str]:
-        """根据域名查找对应的分类"""
-        if not self.geosite_cache:
-            return None
-            
-        domain = domain.lower()
-        
-        # 精确匹配
-        for category, entry in self.geosite_cache.items():
-            if domain in entry.domains:
-                return category
-                
-        # 子域名匹配
-        for category, entry in self.geosite_cache.items():
-            for site_domain in entry.domains:
-                if domain.endswith('.' + site_domain) or domain == site_domain:
-                    return category
                     
         return None
     
-    def get_ip_country(self, ip_str: str) -> Optional[str]:
-        """根据IP地址查找对应的国家代码"""
-        if not self.geoip_cache:
-            return None
-            
-        try:
-            ip = ipaddress.IPv4Address(ip_str)
-            
-            for country_code, entry in self.geoip_cache.items():
-                for network_ip, prefix_len in entry.ip_ranges:
-                    try:
-                        network = ipaddress.IPv4Network(f"{network_ip}/{prefix_len}", strict=False)
-                        if ip in network:
-                            return country_code
-                    except Exception:
-                        continue
-                        
-        except Exception:
-            pass
-            
-        return None
     
     def _get_fallback_geosite_data(self) -> Dict[str, GeositeEntry]:
         """当解析失败时的备用数据"""

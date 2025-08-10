@@ -1,0 +1,18 @@
+{
+    "network_settings": {
+        "proxy_ip_ranges": ["28.0.0.0/8"],
+        "local_ip_ranges": ["192.168.31.0/24"],
+        "proxy_device_name": "Clash设备",
+        "proxy_type": "Clash代理",
+        "direct_device_name_template": "直连设备 {ip}"
+    },
+    "monitoring": {
+        "interface_check_interval": 5,
+        "connection_timeout": 30,
+        "max_recent_connections": 1000
+    },
+    "display": {
+        "max_unknown_sites_display": 3,
+        "refresh_interval": 1
+    }
+}

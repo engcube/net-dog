@@ -14,6 +14,7 @@ import ipaddress
 from typing import Dict, List, Optional, Set, Tuple
 import threading
 from v2ray_dat_parser import V2RayDatParser
+from utils import is_china_ip
 
 class GeositeLoader:
     def __init__(self, data_dir: str = "data"):
@@ -35,7 +36,7 @@ class GeositeLoader:
         # 初始化加载数据
         self._load_data()
     
-    def _get_latest_release_url(self) -> Tuple[str, str]:
+    def _get_latest_release_url(self) -> Tuple[Optional[str], Optional[str]]:
         """获取最新版本的下载链接"""
         api_url = "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest"
         try:
@@ -54,11 +55,8 @@ class GeositeLoader:
             return geosite_url, geoip_url
         except Exception as e:
             print(f"获取最新版本失败: {e}")
-            # 使用固定的最新版本链接作为后备
-            return (
-                "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/202508082214/geosite.dat",
-                "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/202508082214/geoip.dat"
-            )
+            # 如果无法获取最新版本，返回None让调用方处理
+            return None, None
     
     def _download_file(self, url: str, filename: str) -> bool:
         """下载数据文件"""
@@ -165,9 +163,13 @@ class GeositeLoader:
                 print("检查数据文件更新...")
                 geosite_url, geoip_url = self._get_latest_release_url()
                 
-                # 下载最新数据文件
-                self._download_file(geosite_url, 'geosite.dat')
-                self._download_file(geoip_url, 'geoip.dat')
+                # 只有成功获取URL时才尝试下载
+                if geosite_url and geoip_url:
+                    print("找到最新版本，开始下载...")
+                    self._download_file(geosite_url, 'geosite.dat')
+                    self._download_file(geoip_url, 'geoip.dat')
+                else:
+                    print("无法获取最新版本URL，跳过更新")
                 
                 self.last_update = time.time()
             
@@ -259,12 +261,11 @@ class GeositeLoader:
                     except (ipaddress.AddressValueError, ValueError):
                         continue
             
-            # 兜底：简化的中国IP检测
-            first_octet = int(ip.split('.')[0])
-            cn_ranges = [1, 14, 27, 36, 39, 42, 49, 58, 59, 60, 61, 
-                        101, 103, 106, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 
-                        175, 180, 182, 183, 202, 203, 210, 211, 218, 219, 220, 221, 222, 223]
-            return 'cn' if first_octet in cn_ranges else 'us'
+            # 兜底：使用统一的中国IP检测
+            if is_china_ip(ip):
+                return 'cn'
+            else:
+                return None  # 无法确定时返回None而不是假设为'us'
             
         except Exception:
             return None

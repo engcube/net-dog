@@ -5,10 +5,8 @@
 智能网络流量实时监控和分析
 """
 
-import subprocess
 import time
 import json
-import re
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
@@ -18,6 +16,8 @@ import socket
 # 导入增强的域名解析器和GeoSite数据
 from domain_resolver import domain_resolver
 from geosite_loader import geosite_loader
+from utils import is_china_ip
+from data_collector import create_data_collector
 
 try:
     from rich.console import Console
@@ -34,12 +34,44 @@ except ImportError:
     exit(1)
 
 class NetworkMonitor:
-    def __init__(self):
+    def __init__(self, config_file="config.json"):
         self.console = Console()
         self.data_lock = threading.Lock()
         self.running = False
         self.start_time = datetime.now()  # 记录启动时间
+        self.config = self._load_config(config_file)
         
+        # 初始化其他属性
+        self._initialize_data_structures()
+        
+    def _load_config(self, config_file):
+        """加载配置文件"""
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            # 返回默认配置
+            return {
+                "network_settings": {
+                    "proxy_ip_ranges": ["28.0.0.0/8"],
+                    "local_ip_ranges": ["192.168.31.0/24"],
+                    "proxy_device_name": "Clash设备",
+                    "proxy_type": "Clash代理",
+                    "direct_device_name_template": "直连设备 {ip}"
+                },
+                "monitoring": {
+                    "interface_check_interval": 5,
+                    "connection_timeout": 30,
+                    "max_recent_connections": 1000
+                },
+                "display": {
+                    "max_unknown_sites_display": 3,
+                    "refresh_interval": 1
+                }
+            }
+        
+    def _initialize_data_structures(self):
+        """初始化所有数据结构"""
         # 简化数据存储 - 避免重复
         self.device_stats = defaultdict(lambda: {
             'ip': '',
@@ -67,37 +99,20 @@ class NetworkMonitor:
         self.last_total_bytes_up = 0
         self.last_total_bytes_down = 0
         self.last_speed_time = time.time()
-        self.local_network = self._detect_local_network()
+        self.local_network = None  # 稍后初始化
         
         # 连接跟踪（用于流量模式推断）
         self.recent_connections = set()  # 最近的连接IP
         self.connection_history = deque(maxlen=100)  # 连接历史
         
-    def _detect_local_network(self) -> str:
-        """检测本地网络段"""
+        # 初始化数据收集器
         try:
-            result = subprocess.run(['route', '-n', 'get', 'default'], capture_output=True, text=True)
-            gateway_match = re.search(r'gateway: ([\d.]+)', result.stdout)
-            if gateway_match:
-                gateway = gateway_match.group(1)
-                return '.'.join(gateway.split('.')[:-1]) + '.0/24'
-            return '192.168.31.0/24'
-        except:
-            return '192.168.31.0/24'
-    
-    def _get_arp_table(self) -> Dict[str, str]:
-        """获取ARP表，返回 {ip: mac}"""
-        devices = {}
-        try:
-            result = subprocess.run(['arp', '-a'], capture_output=True, text=True)
-            for line in result.stdout.split('\n'):
-                match = re.search(r'\(([\d.]+)\)\s+at\s+([a-f0-9:]+)', line.lower())
-                if match:
-                    ip, mac = match.groups()
-                    devices[ip] = mac
-        except Exception as e:
-            print(f"ARP table error: {e}")
-        return devices
+            self.data_collector = create_data_collector()
+            # 初始化网络检测（必须在其他属性初始化完成后）
+            self.local_network = self.data_collector.detect_local_network()
+        except NotImplementedError as e:
+            print(f"❌ 平台不支持: {e}")
+            raise
     
     def _resolve_hostname(self, ip: str) -> str:
         """解析IP对应的主机名"""
@@ -113,59 +128,41 @@ class NetworkMonitor:
     
     def _get_active_connections(self) -> List[Dict]:
         """获取活跃的网络连接"""
-        connections = []
         try:
-            result = subprocess.run(['netstat', '-n'], capture_output=True, text=True)
-            seen_connections = set()  # 避免重复连接
+            # 使用数据收集器获取原始连接数据
+            raw_connections = self.data_collector.get_connections()
+            connections = []
+            seen_connections = set()
             
-            for line in result.stdout.split('\n'):
-                if 'tcp4' in line:
-                    parts = line.split()
-                    if len(parts) >= 6 and parts[5] == 'ESTABLISHED':
-                        local_addr = parts[3]
-                        foreign_addr = parts[4]
-                        
-                        # 处理不同格式的地址（IP:端口 或 IP.端口）
-                        def extract_ip(addr):
-                            if ':' in addr:
-                                return addr.split(':')[0]
-                            elif '.' in addr:
-                                # 对于形如 192.168.31.31.65302 的格式，取前4段作为IP
-                                parts = addr.split('.')
-                                if len(parts) >= 4:
-                                    return '.'.join(parts[:4])
-                            return addr
-                        
-                        local_ip = extract_ip(local_addr)
-                        foreign_ip = extract_ip(foreign_addr)
-                        
-                        # 只关心本地到外网的连接
-                        is_local = (local_ip.startswith(('192.168.', '10.', '28.')) or 
-                                  (local_ip.startswith('172.') and 16 <= int(local_ip.split('.')[1]) <= 31))
-                        is_foreign = not foreign_ip.startswith(('192.168.', '10.', '172.', '127.', '28.', 'fe80', 'fd', '169.254'))
-                        
-                        if is_local and is_foreign:
-                            conn_key = f"{local_ip}->{foreign_ip}"
-                            if conn_key not in seen_connections:
-                                seen_connections.add(conn_key)
-                                connections.append({
-                                    'local_ip': local_ip,
-                                    'foreign_ip': foreign_ip,
-                                    'protocol': 'tcp'
-                                })
+            for conn in raw_connections:
+                local_ip = conn['local_ip']
+                foreign_ip = conn['foreign_ip']
+                
+                # 只关心本地到外网的连接
+                is_local = (local_ip.startswith(('192.168.', '10.', '28.')) or 
+                          (local_ip.startswith('172.') and 16 <= int(local_ip.split('.')[1]) <= 31))
+                is_foreign = not foreign_ip.startswith(('192.168.', '10.', '172.', '127.', '28.', 'fe80', 'fd', '169.254'))
+                
+                if is_local and is_foreign:
+                    conn_key = f"{local_ip}->{foreign_ip}"
+                    if conn_key not in seen_connections:
+                        seen_connections.add(conn_key)
+                        connections.append({
+                            'local_ip': local_ip,
+                            'foreign_ip': foreign_ip,
+                            'protocol': conn.get('protocol', 'tcp')
+                        })
+            
+            return connections
         except:
-            pass
-        return connections
+            return []
     
     def _resolve_domain(self, ip: str) -> str:
         """增强的IP到域名解析"""
         return domain_resolver.resolve_domain(ip)
     
-    def _categorize_domain(self, domain: str, ip: str) -> Tuple[str, str]:
-        """分类域名，返回(类别, 地区) - 完全使用GeoSite数据"""
-        domain_lower = domain.lower().replace('(未知网站)', '')
-        
-        # 1. 优先通过IP识别服务（如Telegram）- 更准确
+    def _detect_ip_service(self, ip: str) -> Optional[Tuple[str, str]]:
+        """通过IP识别服务（如Telegram）"""
         try:
             ip_service = geosite_loader.get_ip_service(ip)
             if ip_service:
@@ -176,8 +173,10 @@ class NetworkMonitor:
                 return display_name, '海外'
         except Exception:
             pass
-        
-        # 2. 特殊域名映射（补充GeoSite数据中缺失的）
+        return None
+    
+    def _check_special_domain_mappings(self, domain_lower: str) -> Optional[Tuple[str, str]]:
+        """检查特殊域名映射"""
         special_domains = {
             '1e100.net': ('Google', '海外'),
             'dns.google': ('Google', '海外'), 
@@ -209,7 +208,10 @@ class NetworkMonitor:
             if domain_lower.endswith(special_domain) or domain_lower == special_domain:
                 return service, location
         
-        # 3. 使用GeoSite数据库进行域名分类
+        return None
+    
+    def _lookup_geosite_database(self, domain_lower: str, ip: str) -> Optional[Tuple[str, str]]:
+        """使用GeoSite数据库进行域名分类"""
         try:
             category = geosite_loader.get_domain_category(domain_lower)
             if category:
@@ -218,117 +220,153 @@ class NetworkMonitor:
                 location = '中国' if country == 'cn' else '海外'
                 
                 # 标准化分类名称
-                category_map = {
-                    'youtube': 'YouTube',
-                    'google': 'Google',
-                    'facebook': 'Facebook',
-                    'twitter': 'Twitter/X',
-                    'telegram': 'Telegram',
-                    'apple': 'Apple',
-                    'microsoft': 'Microsoft',
-                    'amazon': 'Amazon',
-                    'netflix': 'Netflix',
-                    'spotify': 'Spotify',
-                    'github': 'GitHub',
-                    'cloudflare': 'Cloudflare',
-                    'baidu': '百度',
-                    'tencent': '腾讯/QQ',
-                    'alibaba': '阿里系',
-                    'bytedance': '抖音/TikTok',
-                    'tiktok': '抖音/TikTok',
-                    'bilibili': 'B站'
-                }
-                
-                display_name = category_map.get(category.lower(), category.capitalize())
+                display_name = self._standardize_category_name(category)
                 return display_name, location
         except Exception:
             pass
+        return None
+    
+    def _standardize_category_name(self, category: str) -> str:
+        """标准化分类名称"""
+        category_map = {
+            'youtube': 'YouTube',
+            'google': 'Google',
+            'facebook': 'Facebook',
+            'twitter': 'Twitter/X',
+            'telegram': 'Telegram',
+            'apple': 'Apple',
+            'microsoft': 'Microsoft',
+            'amazon': 'Amazon',
+            'netflix': 'Netflix',
+            'spotify': 'Spotify',
+            'github': 'GitHub',
+            'cloudflare': 'Cloudflare',
+            'baidu': '百度',
+            'tencent': '腾讯/QQ',
+            'alibaba': '阿里系',
+            'bytedance': '抖音/TikTok',
+            'tiktok': '抖音/TikTok',
+            'bilibili': 'B站'
+        }
         
-        # 4. IP范围启发式识别（当域名解析失败时）
+        return category_map.get(category.lower(), category.capitalize())
+    
+    def _identify_by_ip_ranges(self, domain: str, ip: str) -> Optional[Tuple[str, str]]:
+        """通过IP范围启发式识别服务"""
         if not domain or domain == ip:
-            # 抖音/字节跳动已知IP段识别
-            try:
-                octets = [int(x) for x in ip.split('.')]
-                first, second, third = octets[0], octets[1], octets[2]
-                
-                # 抖音/字节跳动常用IP段（基于真实观察）
-                if (first == 122 and second == 14 and 220 <= third <= 235) or \
-                   (first == 123 and second == 14 and 220 <= third <= 235) or \
-                   (first == 117 and second == 93 and 180 <= third <= 200) or \
-                   (first == 110 and second == 43 and 0 <= third <= 50) or \
-                   (first == 36 and second == 51 and 0 <= third <= 255):
-                    return '抖音/TikTok', '中国'
-                
-                # TikTok海外IP段
-                if (first == 108 and 20 <= second <= 30) or \
-                   (first == 151 and second == 101):
-                    return '抖音/TikTok', '海外'
-                        
-            except (ValueError, IndexError):
-                pass
-        
-        # 5. 使用流量模式推断（基于连接行为特征）
+            return self._check_douyin_ip_ranges(ip)
+        return None
+    
+    def _check_douyin_ip_ranges(self, ip: str) -> Optional[Tuple[str, str]]:
+        """检查抖音/字节跳动已知IP段"""
         try:
-            # 抖音CDN特征检测：当用户正在访问抖音时的特殊处理
+            octets = [int(x) for x in ip.split('.')]
+            first, second, third = octets[0], octets[1], octets[2]
+            
+            # 抖音/字节跳动常用IP段（基于真实观察）
+            if (first == 122 and second == 14 and 220 <= third <= 235) or \
+               (first == 123 and second == 14 and 220 <= third <= 235) or \
+               (first == 117 and second == 93 and 180 <= third <= 200) or \
+               (first == 110 and second == 43 and 0 <= third <= 50) or \
+               (first == 36 and second == 51 and 0 <= third <= 255):
+                return '抖音/TikTok', '中国'
+            
+            # TikTok海外IP段
+            if (first == 108 and 20 <= second <= 30) or \
+               (first == 151 and second == 101):
+                return '抖音/TikTok', '海外'
+        
+        except (ValueError, IndexError):
+            pass
+        
+        return None
+    
+    def _analyze_traffic_patterns(self, ip: str) -> Optional[Tuple[str, str]]:
+        """使用流量模式推断服务类型"""
+        try:
+            # 检查抖音CDN模式
+            douyin_result = self._check_douyin_cdn_patterns(ip)
+            if douyin_result:
+                return douyin_result
+            
+            # 检查通用视频服务模式
+            video_result = self._check_video_service_patterns(ip)
+            if video_result:
+                return video_result
+            
+        except Exception:
+            pass
+        
+        return None
+    
+    def _check_douyin_cdn_patterns(self, ip: str) -> Optional[Tuple[str, str]]:
+        """检查抖音CDN特征"""
+        try:
             octets = [int(x) for x in ip.split('.')]
             first, second = octets[0], octets[1]
             
-            # 抖音常用的CDN IP范围（基于观察到的实际连接）
+            # 抖音常用的CDN IP范围
             douyin_cdn_patterns = [
-                (39, 137),   # 39.137.x.x - 抖音主要CDN
-                (39, 173),   # 39.173.x.x - 抖音视频CDN
-                (39, 135),   # 39.135.x.x - 抖音API服务
-                (117, 135),  # 117.135.x.x - 阿里云上的抖音服务
-                (36, 156),   # 36.156.x.x - 抖音移动端CDN
-                (183, 192),  # 183.192.x.x - 腾讯云上的抖音服务
-                (111, 62),   # 111.62.x.x - 阿里云抖音API
-                (221, 181),  # 221.181.x.x - 抖音直播CDN
-                (120, 202),  # 120.202.x.x - 抖音短视频CDN
+                (39, 137), (39, 173), (39, 135), (117, 135),
+                (36, 156), (183, 192), (111, 62), (221, 181), (120, 202)
             ]
             
             for cdn_first, cdn_second in douyin_cdn_patterns:
                 if first == cdn_first and second == cdn_second:
-                    # 进一步检查是否有大量相似连接（抖音特征）
                     if hasattr(self, 'recent_connections'):
                         prefix_match = f'{first}.{second}'
                         similar_count = sum(1 for conn_ip in self.recent_connections 
                                           if conn_ip.startswith(prefix_match))
                         
-                        # 如果有2个以上相同网段连接，很可能是抖音
                         if similar_count >= 2:
                             return '抖音/TikTok', '中国'
                     
-                    # 即使没有足够连接数，也标记为可能的抖音服务
                     return '疑似抖音/TikTok', '中国'
-                    
-            # 通用视频服务模式检测
+        
+        except (ValueError, IndexError):
+            pass
+        
+        return None
+    
+    def _check_video_service_patterns(self, ip: str) -> Optional[Tuple[str, str]]:
+        """检查通用视频服务模式"""
+        try:
+            octets = [int(x) for x in ip.split('.')]
+            first = octets[0]
+            
             if hasattr(self, 'recent_connections'):
-                ip_prefix = '.'.join(ip.split('.')[:2])  # 取前两段
+                ip_prefix = '.'.join(ip.split('.')[:2])
                 similar_ips = [conn_ip for conn_ip in self.recent_connections 
                              if conn_ip.startswith(ip_prefix) and conn_ip != ip]
                 
-                # 如果有3个以上相似IP的连接，可能是视频服务
                 if len(similar_ips) >= 3:
                     # 中国IP段的启发式检测
-                    if first in [110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 
-                               120, 121, 122, 123, 124, 125, 36, 39, 42, 49, 58, 59, 60, 61]:
+                    china_ip_ranges = [110, 111, 112, 113, 114, 115, 116, 117, 118, 119,
+                                     120, 121, 122, 123, 124, 125, 36, 39, 42, 49, 58, 59, 60, 61]
+                    if first in china_ip_ranges:
                         return '视频服务', '中国'
-        except Exception:
+        
+        except (ValueError, IndexError):
             pass
         
-        # 6. 智能IP识别（基于多数据源和机器学习）
+        return None
+    
+    def _try_smart_ip_identification(self, ip: str) -> Optional[Tuple[str, str]]:
+        """尝试智能IP识别"""
         try:
             from smart_ip_identifier import smart_ip_identifier
             provider, region, confidence = smart_ip_identifier.identify_ip(ip)
             
-            # 只有在置信度较高时才使用识别结果
             if confidence > 0.5:
                 return provider, region
-                
+        
         except Exception:
             pass
         
-        # 7. 兜底：根据IP判断地区
+        return None
+    
+    def _fallback_geographic_classification(self, ip: str) -> Tuple[str, str]:
+        """兜底：根据IP地理位置分类"""
         try:
             country = geosite_loader.get_ip_country(ip)
             if country == 'cn':
@@ -336,315 +374,352 @@ class NetworkMonitor:
             else:
                 return '海外网站', '海外'
         except Exception:
-            # 最终兜底：使用简化的IP检测
-            is_china = self._is_china_ip(ip)
+            # 最终兜底
+            is_china = is_china_ip(ip)
             return ('中国网站' if is_china else '海外网站'), ('中国' if is_china else '海外')
+    
+    def _categorize_domain(self, domain: str, ip: str) -> Tuple[str, str]:
+        """分类域名，返回(类别, 地区) - 重构为更小的函数"""
+        domain_lower = domain.lower().replace('(未知网站)', '')
+        
+        # 1. 优先通过IP识别服务
+        result = self._detect_ip_service(ip)
+        if result:
+            return result
+        
+        # 2. 特殊域名映射
+        result = self._check_special_domain_mappings(domain_lower)
+        if result:
+            return result
+        
+        # 3. 使用GeoSite数据库
+        result = self._lookup_geosite_database(domain_lower, ip)
+        if result:
+            return result
+        
+        # 4. IP范围启发式识别
+        result = self._identify_by_ip_ranges(domain, ip)
+        if result:
+            return result
+        
+        # 5. 使用流量模式推断
+        result = self._analyze_traffic_patterns(ip)
+        if result:
+            return result
+        
+        # 6. 智能IP识别
+        result = self._try_smart_ip_identification(ip)
+        if result:
+            return result
+        
+        # 7. 兜底方案
+        return self._fallback_geographic_classification(ip)
     
     # 旧的硬编码分类方法已移除，现在完全使用GeoSite数据
     
-    def _is_china_ip(self, ip: str) -> bool:
-        """检查是否为中国IP"""
-        try:
-            first_octet = int(ip.split('.')[0])
-            china_ranges = [1, 14, 27, 36, 39, 42, 49, 58, 59, 60, 61, 
-                           101, 103, 106, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 
-                           175, 180, 182, 183, 202, 203, 210, 211, 218, 219, 220, 221, 222, 223]
-            return first_octet in china_ranges
-        except (ValueError, IndexError):
-            return False
+    def _collect_network_data(self):
+        """收集网络数据：ARP表、活跃连接和接口统计"""
+        return (
+            self.data_collector.get_arp_table(),
+            self._get_active_connections(),
+            self.data_collector.get_interface_stats()
+        )
     
-    def _get_interface_stats(self) -> Dict:
-        """获取网络接口统计"""
-        stats = {}
-        try:
-            result = subprocess.run(['netstat', '-ib'], capture_output=True, text=True)
-            lines = result.stdout.split('\n')
+    def _update_device_records(self, arp_devices, connections):
+        """更新设备记录，包括ARP设备和虚拟设备"""
+        current_devices = set()
+        
+        # 处理ARP表中的设备
+        for ip, mac in arp_devices.items():
+            device_key = ip
+            current_devices.add(device_key)
             
-            for line in lines:
-                if line.strip() and not line.startswith('Name'):
-                    parts = line.split()
-                    if len(parts) >= 10:
-                        interface = parts[0]
-                        if (interface.startswith(('en', 'utun')) and 
-                            not interface.startswith('lo') and
-                            '*' not in interface):
-                            try:
-                                if parts[6].isdigit() and parts[9].isdigit():
-                                    bytes_in = int(parts[6])
-                                    bytes_out = int(parts[9])
-                                    
-                                    if bytes_in > 0 or bytes_out > 0:
-                                        stats[interface] = {
-                                            'bytes_in': bytes_in,
-                                            'bytes_out': bytes_out
-                                        }
-                            except (ValueError, IndexError):
-                                continue
-        except:
-            pass
-        return stats
+            if device_key not in self.device_stats:
+                self.device_stats[device_key] = {
+                    'ip': ip,
+                    'mac': mac,
+                    'hostname': self._resolve_hostname(ip),
+                    'bytes_in': 0,
+                    'bytes_out': 0,
+                    'last_seen': datetime.now(),
+                    'is_local': True
+                }
+            else:
+                self.device_stats[device_key]['last_seen'] = datetime.now()
+        
+        # 创建虚拟设备（VPN和直连）
+        self._create_virtual_devices(connections, current_devices, arp_devices)
+        
+        return current_devices
+    
+    def _create_virtual_devices(self, connections, current_devices, arp_devices):
+        """创建虚拟设备（Clash VPN设备和直连设备）"""
+        vpn_connections = [conn for conn in connections if conn['local_ip'].startswith('28.0.0.')]
+        local_connections = [conn for conn in connections if conn['local_ip'].startswith('192.168.31.')]
+        
+        # 创建Clash设备（TUN模式）
+        if vpn_connections:
+            clash_key = "Clash设备"
+            current_devices.add(clash_key)
+            if clash_key not in self.device_stats:
+                self.device_stats[clash_key] = {
+                    'ip': '28.0.0.x',
+                    'mac': 'virtual',
+                    'hostname': f'Clash代理({len(vpn_connections)}个连接)',
+                    'bytes_in': 0,
+                    'bytes_out': 0,
+                    'last_seen': datetime.now(),
+                    'is_local': False
+                }
+            else:
+                self.device_stats[clash_key]['hostname'] = f'Clash代理({len(vpn_connections)}个连接)'
+                self.device_stats[clash_key]['last_seen'] = datetime.now()
+        
+        # 创建直连设备（绕过Clash的流量）
+        if local_connections:
+            direct_key = "直连设备"
+            current_devices.add(direct_key)
+            if direct_key not in self.device_stats:
+                main_ip = '192.168.31.31'
+                hostname = 'mmini'
+                self.device_stats[direct_key] = {
+                    'ip': f'{main_ip}(多端口)',
+                    'mac': arp_devices.get(main_ip, 'unknown'),
+                    'hostname': f'{hostname}({len(local_connections)}个直连)',
+                    'bytes_in': 0,
+                    'bytes_out': 0,
+                    'last_seen': datetime.now(),
+                    'is_local': True
+                }
+            else:
+                self.device_stats[direct_key]['hostname'] = f'mmini({len(local_connections)}个直连)'
+                self.device_stats[direct_key]['last_seen'] = datetime.now()
+    
+    def _calculate_traffic_deltas(self, interface_stats, last_interface_stats):
+        """计算接口流量增量"""
+        total_period_traffic_in = 0
+        total_period_traffic_out = 0
+        
+        for interface, stats in interface_stats.items():
+            if interface in last_interface_stats:
+                bytes_in_diff = max(0, stats['bytes_in'] - last_interface_stats[interface]['bytes_in'])
+                bytes_out_diff = max(0, stats['bytes_out'] - last_interface_stats[interface]['bytes_out'])
+                total_period_traffic_in += bytes_in_diff
+                total_period_traffic_out += bytes_out_diff
+        
+        return total_period_traffic_in, total_period_traffic_out
+    
+    def _process_connections_and_domains(self, connections, current_devices, arp_devices):
+        """处理连接并进行域名分类"""
+        device_connections = defaultdict(int)
+        domain_connections = defaultdict(set)
+        
+        for conn in connections:
+            local_ip = conn['local_ip']
+            foreign_ip = conn['foreign_ip']
+            
+            # 跟踪连接IP（用于流量模式推断）
+            self.recent_connections.add(foreign_ip)
+            self.connection_history.append((foreign_ip, time.time()))
+            
+            # 确定设备
+            device_key = self._determine_device_key(local_ip, current_devices, arp_devices)
+            device_connections[device_key] += 1
+            
+            # 处理域名和网站分类
+            website_name = self._process_domain_classification(foreign_ip, device_key)
+            domain_connections[website_name].add(device_key)
+        
+        return device_connections, domain_connections
+    
+    def _determine_device_key(self, local_ip, current_devices, arp_devices):
+        """确定连接对应的设备键"""
+        if local_ip.startswith('28.0.0.'):
+            return "Clash设备"
+        elif local_ip.startswith('192.168.31.'):
+            return "直连设备"
+        else:
+            device_key = local_ip
+            if device_key not in current_devices:
+                current_devices.add(device_key)
+                self.device_stats[device_key] = {
+                    'ip': local_ip,
+                    'mac': arp_devices.get(local_ip, 'unknown'),
+                    'hostname': f'设备-{local_ip.split(".")[-1]}',
+                    'bytes_in': 0,
+                    'bytes_out': 0,
+                    'last_seen': datetime.now(),
+                    'is_local': True
+                }
+            return device_key
+    
+    def _process_domain_classification(self, foreign_ip, device_key):
+        """处理域名解析和分类"""
+        raw_domain = self._resolve_domain(foreign_ip)
+        category, location = self._categorize_domain(raw_domain, foreign_ip)
+        
+        # 优先使用网站分类作为显示名称，实现服务合并
+        if category and category not in ['中国网站', '海外网站']:
+            website_name = category
+        else:
+            if raw_domain != foreign_ip and not raw_domain.endswith('(未知网站)'):
+                website_name = raw_domain
+            else:
+                website_name = f"{foreign_ip}(未知网站)"
+        
+        # 更新网站信息
+        if website_name not in self.domain_stats[device_key]:
+            self.domain_stats[device_key][website_name] = {
+                'bytes_up': 0,
+                'bytes_down': 0,
+                'connections': 0,
+                'ips': {foreign_ip},
+                'location': location,
+                'category': category
+            }
+        else:
+            self.domain_stats[device_key][website_name]['category'] = category
+            self.domain_stats[device_key][website_name]['location'] = location
+            self.domain_stats[device_key][website_name]['ips'].add(foreign_ip)
+        
+        return website_name
+    
+    def _allocate_traffic_to_devices(self, total_period_traffic, device_connections, current_devices):
+        """分配流量到设备"""
+        if total_period_traffic > 0 and device_connections:
+            total_connections = sum(device_connections.values())
+            
+            for device_key, conn_count in device_connections.items():
+                if device_key in current_devices:
+                    traffic_share = (conn_count / total_connections) * total_period_traffic
+                    increment_in = traffic_share * 0.6
+                    increment_out = traffic_share * 0.4
+                    
+                    self.device_stats[device_key]['bytes_in'] += increment_in
+                    self.device_stats[device_key]['bytes_out'] += increment_out
+    
+    def _allocate_traffic_to_websites(self, total_period_traffic_in, total_period_traffic_out, domain_connections):
+        """分配流量到网站"""
+        if total_period_traffic_in + total_period_traffic_out > 0 and domain_connections:
+            website_weights = self._calculate_website_weights(domain_connections)
+            total_weight = sum(website_weights.values())
+            
+            if total_weight > 0:
+                for website_name, connected_devices in domain_connections.items():
+                    website_weight = website_weights[website_name] / total_weight
+                    
+                    total_website_down = total_period_traffic_in * website_weight
+                    total_website_up = total_period_traffic_out * website_weight
+                    
+                    device_count = len(connected_devices)
+                    per_device_down = total_website_down / device_count if device_count > 0 else 0
+                    per_device_up = total_website_up / device_count if device_count > 0 else 0
+                    
+                    for device_key in connected_devices:
+                        if device_key in self.domain_stats:
+                            self.domain_stats[device_key][website_name]['bytes_down'] += per_device_down
+                            self.domain_stats[device_key][website_name]['bytes_up'] += per_device_up
+                            self.domain_stats[device_key][website_name]['connections'] = len(self.domain_stats[device_key][website_name]['ips'])
+    
+    def _calculate_website_weights(self, domain_connections):
+        """计算网站权重（考虑IP多样性）"""
+        website_weights = {}
+        
+        for website_name, connected_devices in domain_connections.items():
+            # 获取该网站的实际IP数量
+            unique_ips = set()
+            for device_key in connected_devices:
+                if device_key in self.domain_stats and website_name in self.domain_stats[device_key]:
+                    unique_ips.update(self.domain_stats[device_key][website_name]['ips'])
+            
+            device_count = len(connected_devices)
+            ip_diversity = len(unique_ips)
+            
+            # 使用哈希因子避免完全相同的权重
+            import hashlib
+            name_hash = int(hashlib.md5(website_name.encode()).hexdigest()[:8], 16)
+            hash_factor = 0.9 + (name_hash % 100) / 500
+            
+            weight = (device_count + ip_diversity * 0.5) * hash_factor
+            website_weights[website_name] = weight
+        
+        return website_weights
+    
+    def _update_speed_calculations(self):
+        """更新速度计算"""
+        current_time = time.time()
+        time_delta = current_time - self.last_speed_time
+        
+        if time_delta > 0:
+            total_up_traffic = sum(d['bytes_out'] for d in self.device_stats.values())
+            total_down_traffic = sum(d['bytes_in'] for d in self.device_stats.values())
+            
+            period_up_traffic = total_up_traffic - self.last_total_bytes_up
+            period_down_traffic = total_down_traffic - self.last_total_bytes_down
+            
+            current_speed_up = period_up_traffic / time_delta if period_up_traffic > 0 else 0
+            current_speed_down = period_down_traffic / time_delta if period_down_traffic > 0 else 0
+            
+            self.speed_data_up.append(current_speed_up)
+            self.speed_data_down.append(current_speed_down)
+            
+            self.last_total_bytes_up = total_up_traffic
+            self.last_total_bytes_down = total_down_traffic
+            self.last_speed_time = current_time
+    
+    def _perform_cache_cleanup(self, last_cache_clean):
+        """执行缓存清理"""
+        current_time = time.time()
+        if current_time - last_cache_clean > 300:  # 5分钟
+            domain_resolver.clear_cache()
+            
+            # 清理旧的IP格式域名数据
+            with self.data_lock:
+                old_keys = [k for k in self.domain_stats.keys() 
+                           if k.count('.') >= 3 and '(未知网站)' in k]
+                for old_key in old_keys:
+                    del self.domain_stats[old_key]
+            
+            return current_time
+        return last_cache_clean
     
     def _monitor_traffic(self):
-        """后台监控线程"""
+        """后台监控线程 - 重构为更小的函数"""
         last_interface_stats = {}
         last_cache_clean = time.time()
         
         while self.running:
             try:
-                # 获取当前数据
-                arp_devices = self._get_arp_table()
-                connections = self._get_active_connections()
-                interface_stats = self._get_interface_stats()
+                # 1. 收集网络数据
+                arp_devices, connections, interface_stats = self._collect_network_data()
                 
                 with self.data_lock:
-                    # 更新设备信息（去重）
-                    current_devices = set()
+                    # 2. 更新设备记录
+                    current_devices = self._update_device_records(arp_devices, connections)
                     
-                    # 处理ARP表中的设备
-                    for ip, mac in arp_devices.items():
-                        device_key = ip  # 使用IP作为设备键
-                        current_devices.add(device_key)
-                        
-                        if device_key not in self.device_stats:
-                            self.device_stats[device_key] = {
-                                'ip': ip,
-                                'mac': mac,
-                                'hostname': self._resolve_hostname(ip),
-                                'bytes_in': 0,
-                                'bytes_out': 0,
-                                'last_seen': datetime.now(),
-                                'is_local': True
-                            }
-                        else:
-                            self.device_stats[device_key]['last_seen'] = datetime.now()
-                    
-                    # 不需要单独处理VPN设备，在连接处理中已经处理了
-                    
-                    # 计算接口流量变化 - 分别统计上行和下行
-                    total_period_traffic_in = 0
-                    total_period_traffic_out = 0
-                    for interface, stats in interface_stats.items():
-                        if interface in last_interface_stats:
-                            bytes_in_diff = max(0, stats['bytes_in'] - last_interface_stats[interface]['bytes_in'])
-                            bytes_out_diff = max(0, stats['bytes_out'] - last_interface_stats[interface]['bytes_out'])
-                            total_period_traffic_in += bytes_in_diff
-                            total_period_traffic_out += bytes_out_diff
-                    
+                    # 3. 计算流量增量
+                    total_period_traffic_in, total_period_traffic_out = self._calculate_traffic_deltas(
+                        interface_stats, last_interface_stats)
                     total_period_traffic = total_period_traffic_in + total_period_traffic_out
                     
-                    # 初始化主要设备（确保VPN设备被创建）
-                    vpn_connections = [conn for conn in connections if conn['local_ip'].startswith('28.0.0.')]
-                    local_connections = [conn for conn in connections if conn['local_ip'].startswith('192.168.31.')]
+                    # 4. 处理连接和域名分类
+                    device_connections, domain_connections = self._process_connections_and_domains(
+                        connections, current_devices, arp_devices)
                     
-                    # 创建Clash设备（TUN模式）
-                    if vpn_connections:
-                        clash_key = "Clash设备"
-                        current_devices.add(clash_key)
-                        if clash_key not in self.device_stats:
-                            self.device_stats[clash_key] = {
-                                'ip': '28.0.0.x',
-                                'mac': 'virtual',
-                                'hostname': f'Clash代理({len(vpn_connections)}个连接)',
-                                'bytes_in': 0,
-                                'bytes_out': 0,
-                                'last_seen': datetime.now(),
-                                'is_local': False
-                            }
-                        else:
-                            self.device_stats[clash_key]['hostname'] = f'Clash代理({len(vpn_connections)}个连接)'
-                            self.device_stats[clash_key]['last_seen'] = datetime.now()
+                    # 5. 分配流量到设备
+                    self._allocate_traffic_to_devices(total_period_traffic, device_connections, current_devices)
                     
-                    # 创建直连设备（绕过Clash的流量）
-                    if local_connections:
-                        direct_key = "直连设备"
-                        current_devices.add(direct_key)
-                        if direct_key not in self.device_stats:
-                            main_ip = '192.168.31.31'
-                            hostname = 'mmini'
-                            self.device_stats[direct_key] = {
-                                'ip': f'{main_ip}(多端口)',
-                                'mac': arp_devices.get(main_ip, 'unknown'),
-                                'hostname': f'{hostname}({len(local_connections)}个直连)',
-                                'bytes_in': 0,
-                                'bytes_out': 0,
-                                'last_seen': datetime.now(),
-                                'is_local': True
-                            }
-                        else:
-                            self.device_stats[direct_key]['hostname'] = f'mmini({len(local_connections)}个直连)'
-                            self.device_stats[direct_key]['last_seen'] = datetime.now()
+                    # 6. 分配流量到网站
+                    self._allocate_traffic_to_websites(total_period_traffic_in, total_period_traffic_out, domain_connections)
                     
-                    # 统计连接并分配流量
-                    device_connections = defaultdict(int)
-                    domain_connections = defaultdict(set)
-                    
-                    for conn in connections:
-                        local_ip = conn['local_ip']
-                        foreign_ip = conn['foreign_ip']
-                        
-                        # 跟踪连接IP（用于流量模式推断）
-                        self.recent_connections.add(foreign_ip)
-                        self.connection_history.append((foreign_ip, time.time()))
-                        
-                        # 确定设备
-                        if local_ip.startswith('28.0.0.'):
-                            device_key = "Clash设备"
-                        elif local_ip.startswith('192.168.31.'):
-                            device_key = "直连设备"
-                        else:
-                            device_key = local_ip
-                            # 为其他设备创建记录
-                            if device_key not in current_devices:
-                                current_devices.add(device_key)
-                                self.device_stats[device_key] = {
-                                    'ip': local_ip,
-                                    'mac': arp_devices.get(local_ip, 'unknown'),
-                                    'hostname': f'设备-{local_ip.split(".")[-1]}',
-                                    'bytes_in': 0,
-                                    'bytes_out': 0,
-                                    'last_seen': datetime.now(),
-                                    'is_local': True
-                                }
-                        
-                        device_connections[device_key] += 1
-                        
-                        # 处理域名和网站分类 - 增强逻辑
-                        raw_domain = self._resolve_domain(foreign_ip)
-                        category, location = self._categorize_domain(raw_domain, foreign_ip)
-                        
-                        # 优先使用网站分类作为显示名称，实现服务合并
-                        if category and category not in ['中国网站', '海外网站']:
-                            # 对于已识别的服务，使用服务名作为聚合键（不包含IP）
-                            website_name = category  # 直接使用服务名，如 "Telegram", "Amazon"
-                        else:
-                            # 如果没有具体分类，优先使用域名
-                            if raw_domain != foreign_ip and not raw_domain.endswith('(未知网站)'):
-                                # 使用解析出的真实域名，保持原格式
-                                website_name = raw_domain
-                            else:
-                                # 对于未知网站，保持原来的格式
-                                website_name = f"{foreign_ip}(未知网站)"
-                        
-                        # 按设备和网站名称聚合
-                        domain_connections[website_name].add(device_key)
-                        
-                        # 更新网站信息 - 按设备分组
-                        if website_name not in self.domain_stats[device_key]:
-                            self.domain_stats[device_key][website_name] = {
-                                'bytes_up': 0,
-                                'bytes_down': 0,
-                                'connections': 0,
-                                'ips': {foreign_ip},
-                                'location': location,
-                                'category': category
-                            }
-                        else:
-                            # 更新现有条目的分类信息和IP列表
-                            self.domain_stats[device_key][website_name]['category'] = category
-                            self.domain_stats[device_key][website_name]['location'] = location
-                            self.domain_stats[device_key][website_name]['ips'].add(foreign_ip)
-                    
-                    # 分配流量（累计方式，不使用平滑）
-                    if total_period_traffic > 0 and device_connections:
-                        total_connections = sum(device_connections.values())
-                        
-                        for device_key, conn_count in device_connections.items():
-                            if device_key in current_devices:
-                                # 计算应分配的流量（仅分配增量）
-                                traffic_share = (conn_count / total_connections) * total_period_traffic
-                                increment_in = traffic_share * 0.6
-                                increment_out = traffic_share * 0.4
-                                
-                                # 累计流量（不覆盖，只增加）
-                                self.device_stats[device_key]['bytes_in'] += increment_in
-                                self.device_stats[device_key]['bytes_out'] += increment_out
-                        
-                        # 网站流量累计 - 基于实际连接活动的差异化分配
-                        if total_period_traffic > 0 and domain_connections:
-                            # 计算每个网站的实际连接权重（考虑IP多样性）
-                            website_weights = {}
-                            total_weight = 0
-                            
-                            for website_name, connected_devices in domain_connections.items():
-                                # 获取该网站的实际IP数量
-                                unique_ips = set()
-                                for device_key in connected_devices:
-                                    if device_key in self.domain_stats and website_name in self.domain_stats[device_key]:
-                                        unique_ips.update(self.domain_stats[device_key][website_name]['ips'])
-                                
-                                # 权重 = 连接设备数 * IP多样性因子
-                                device_count = len(connected_devices)
-                                ip_diversity = len(unique_ips) 
-                                
-                                # 使用更复杂的权重计算：设备数 + IP多样性 + 随机因子避免完全相同
-                                import hashlib
-                                name_hash = int(hashlib.md5(website_name.encode()).hexdigest()[:8], 16)
-                                hash_factor = 0.9 + (name_hash % 100) / 500  # 0.9-1.1之间的因子
-                                
-                                weight = (device_count + ip_diversity * 0.5) * hash_factor
-                                website_weights[website_name] = weight
-                                total_weight += weight
-                            
-                            if total_weight > 0:
-                                # 为每个网站分配差异化流量
-                                for website_name, connected_devices in domain_connections.items():
-                                    website_weight = website_weights[website_name] / total_weight
-                                    
-                                    # 按设备数分配该网站的总流量
-                                    total_website_down = total_period_traffic_in * website_weight
-                                    total_website_up = total_period_traffic_out * website_weight
-                                    
-                                    device_count = len(connected_devices)
-                                    per_device_down = total_website_down / device_count if device_count > 0 else 0
-                                    per_device_up = total_website_up / device_count if device_count > 0 else 0
-                                    
-                                    # 分配给每个连接该网站的设备
-                                    for device_key in connected_devices:
-                                        if device_key in self.domain_stats:
-                                            # 累计网站流量（每个周期的增量）
-                                            self.domain_stats[device_key][website_name]['bytes_down'] += per_device_down
-                                            self.domain_stats[device_key][website_name]['bytes_up'] += per_device_up
-                                            self.domain_stats[device_key][website_name]['connections'] = len(self.domain_stats[device_key][website_name]['ips'])
-                    
-                    # 计算实时速度 - 分上下行
-                    current_time = time.time()
-                    time_delta = current_time - self.last_speed_time
-                    
-                    if time_delta > 0:
-                        # 计算上行和下行速度
-                        total_up_traffic = sum(d['bytes_out'] for d in self.device_stats.values())
-                        total_down_traffic = sum(d['bytes_in'] for d in self.device_stats.values())
-                        
-                        period_up_traffic = total_up_traffic - self.last_total_bytes_up
-                        period_down_traffic = total_down_traffic - self.last_total_bytes_down
-                        
-                        current_speed_up = period_up_traffic / time_delta if period_up_traffic > 0 else 0
-                        current_speed_down = period_down_traffic / time_delta if period_down_traffic > 0 else 0
-                        
-                        self.speed_data_up.append(current_speed_up)
-                        self.speed_data_down.append(current_speed_down)
-                        
-                        self.last_total_bytes_up = total_up_traffic
-                        self.last_total_bytes_down = total_down_traffic
-                        self.last_speed_time = current_time
-                        
-                    
+                    # 7. 更新速度计算
+                    self._update_speed_calculations()
                 
+                # 8. 更新接口统计
                 last_interface_stats = interface_stats.copy()
                 
-                # 定期清理DNS缓存和旧域名数据（每5分钟）
-                current_time = time.time()
-                if current_time - last_cache_clean > 300:  # 5分钟
-                    domain_resolver.clear_cache()
-                    
-                    # 清理旧的IP格式域名数据（保留有效的网站名称数据）
-                    with self.data_lock:
-                        old_keys = [k for k in self.domain_stats.keys() 
-                                   if k.count('.') >= 3 and '(未知网站)' in k]  # IP格式的键
-                        for old_key in old_keys:
-                            del self.domain_stats[old_key]
-                    
-                    last_cache_clean = current_time
+                # 9. 执行缓存清理
+                last_cache_clean = self._perform_cache_cleanup(last_cache_clean)
                 
                 time.sleep(3)
                 

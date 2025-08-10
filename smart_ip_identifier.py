@@ -13,6 +13,7 @@ import os
 from typing import Dict, Optional, Tuple
 import time
 import threading
+from utils import is_china_ip
 
 class SmartIPIdentifier:
     def __init__(self):
@@ -182,7 +183,7 @@ class SmartIPIdentifier:
             pass
         return None
     
-    def _whois_analysis(self, ip: str) -> Optional[Tuple[str, float]]:
+    def _match_ip_by_octet(self, ip: str) -> Optional[Tuple[str, float]]:
         """通过whois信息分析（简化版本）"""
         try:
             # 简化的whois分析，基于IP段特征
@@ -215,6 +216,31 @@ class SmartIPIdentifier:
             pass
         return None
     
+    def _asn_lookup(self, ip: str) -> Optional[Tuple[str, float]]:
+        """真正的ASN查询"""
+        try:
+            # 使用whois命令查询ASN信息
+            result = subprocess.run(['whois', ip], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                
+                # 匹配已知的ASN和关键词
+                for provider, info in self.known_providers.items():
+                    # 检查ASN范围
+                    for asn in info.get('asn_ranges', []):
+                        if f'as{asn}' in output or f'asn{asn}' in output:
+                            return provider.title(), 0.9
+                    
+                    # 检查关键词
+                    for keyword in info.get('keywords', []):
+                        if keyword in output:
+                            return provider.title(), 0.8
+                            
+            return None
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+            # 如果whois命令不可用，返回None
+            return None
+    
     def identify_ip(self, ip: str) -> Tuple[str, str, float]:
         """
         智能识别IP地址
@@ -241,7 +267,12 @@ class SmartIPIdentifier:
         
         # 3. 简化的whois分析
         if confidence < 0.7:  # 只有在置信度较低时才进行whois
-            result = self._whois_analysis(ip)
+            result = self._match_ip_by_octet(ip)
+            
+            # 尝试真实的ASN查询  
+            asn_result = self._asn_lookup(ip)
+            if asn_result:
+                result = asn_result
             if result and result[1] > confidence:
                 provider, confidence = result
         
@@ -274,7 +305,7 @@ class SmartIPIdentifier:
                 region = '海外' if not provider.startswith('china') else '中国'
         else:
             # 兜底：基于IP判断地区
-            if self._is_china_ip(ip):
+            if is_china_ip(ip):
                 provider_name, region = '中国网站', '中国'
             else:
                 provider_name, region = '海外网站', '海外'
@@ -295,16 +326,6 @@ class SmartIPIdentifier:
         
         return provider_name, region, confidence
     
-    def _is_china_ip(self, ip: str) -> bool:
-        """简化的中国IP判断"""
-        try:
-            first_octet = int(ip.split('.')[0])
-            china_ranges = [1, 14, 27, 36, 39, 42, 49, 58, 59, 60, 61, 
-                           101, 103, 106, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 
-                           175, 180, 182, 183, 202, 203, 210, 211, 218, 219, 220, 221, 222, 223]
-            return first_octet in china_ranges
-        except:
-            return False
 
 # 全局实例
 smart_ip_identifier = SmartIPIdentifier()
