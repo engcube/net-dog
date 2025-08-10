@@ -29,6 +29,9 @@ class GeositeLoader:
         # 确保数据目录存在
         os.makedirs(data_dir, exist_ok=True)
         
+        # 使用新的完整解析器
+        self.parser = V2RayDatParser()
+        
         # 初始化加载数据
         self._load_data()
     
@@ -72,28 +75,41 @@ class GeositeLoader:
             return False
     
     def _parse_geosite_dat(self, filepath: str) -> Dict[str, List[str]]:
-        """解析 geosite.dat 文件 - 使用优化的解析器"""
+        """解析 geosite.dat 文件 - 使用完整解析器"""
         try:
-            # 使用新的V2Ray DAT解析器
-            geosite_data_sets = V2RayDatParser.parse_geosite_dat(filepath)
+            # 使用新的完整V2Ray DAT解析器
+            geosite_entries = self.parser.parse_geosite_dat(filepath)
             
-            # 转换Set为List格式
+            # 转换为原有格式
             geosite_data = {}
-            for category, domain_set in geosite_data_sets.items():
-                geosite_data[category] = list(domain_set)
+            for category, entry in geosite_entries.items():
+                geosite_data[category] = entry.domains
             
+            print(f"✅ 成功加载 {len(geosite_data)} 个分类，{sum(len(domains) for domains in geosite_data.values())} 个域名")
             return geosite_data
             
         except Exception as e:
             print(f"解析 geosite.dat 失败: {e}")
             # 返回后备数据
-            return V2RayDatParser._get_fallback_geosite_data()
+            fallback_entries = self.parser._get_fallback_geosite_data()
+            return {category: entry.domains for category, entry in fallback_entries.items()}
     
     def _parse_geoip_dat(self, filepath: str) -> Dict[str, List[str]]:
-        """解析 geoip.dat 文件 - 使用优化的解析器"""
+        """解析 geoip.dat 文件 - 使用完整解析器"""
         try:
-            # 使用新的V2Ray DAT解析器
-            return V2RayDatParser.parse_geoip_dat(filepath)
+            # 使用新的完整V2Ray DAT解析器
+            geoip_entries = self.parser.parse_geoip_dat(filepath)
+            
+            # 转换为原有格式 (国家代码 -> CIDR列表)
+            geoip_data = {}
+            for country_code, entry in geoip_entries.items():
+                cidr_list = []
+                for ip, prefix in entry.ip_ranges:
+                    cidr_list.append(f"{ip}/{prefix}")
+                geoip_data[country_code] = cidr_list
+            
+            print(f"✅ 成功加载 {len(geoip_data)} 个国家/地区的IP段")
+            return geoip_data
             
         except Exception as e:
             print(f"解析 geoip.dat 失败: {e}")
@@ -105,13 +121,16 @@ class GeositeLoader:
             }
     
     def _build_lookup_cache(self):
-        """构建快速查找缓存"""
+        """构建快速查找缓存 - 支持多分类映射"""
         with self.lock:
-            # 构建域名到分类的映射
+            # 构建域名到分类列表的映射
             self.domain_to_category.clear()
             for category, domains in self.geosite_data.items():
                 for domain in domains:
-                    self.domain_to_category[domain.lower()] = category
+                    domain_lower = domain.lower()
+                    if domain_lower not in self.domain_to_category:
+                        self.domain_to_category[domain_lower] = []
+                    self.domain_to_category[domain_lower].append(category)
             
             print(f"加载了 {len(self.domain_to_category)} 个域名映射")
             print(f"支持 {len(self.geosite_data)} 个网站分类")
@@ -186,20 +205,45 @@ class GeositeLoader:
         self._build_lookup_cache()
     
     def get_domain_category(self, domain: str) -> Optional[str]:
-        """获取域名的分类"""
+        """获取域名的分类 - 优先返回服务分类而非地理位置分类"""
         domain_lower = domain.lower()
         
         with self.lock:
+            matched_categories = []
+            
             # 直接匹配
             if domain_lower in self.domain_to_category:
-                return self.domain_to_category[domain_lower]
+                matched_categories.extend(self.domain_to_category[domain_lower])
             
             # 子域名匹配
-            for registered_domain, category in self.domain_to_category.items():
+            for registered_domain, categories in self.domain_to_category.items():
                 if domain_lower.endswith('.' + registered_domain) or domain_lower == registered_domain:
-                    return category
-        
-        return None
+                    for category in categories:
+                        if category not in matched_categories:
+                            matched_categories.append(category)
+            
+            if not matched_categories:
+                return None
+                
+            # 优先级排序：服务分类 > 地理位置分类
+            service_categories = [cat for cat in matched_categories 
+                                if not cat.startswith('GEOLOCATION-') and not cat.startswith('CATEGORY-')]
+            
+            if service_categories:
+                # 优先返回知名服务（更具体的服务优先级更高）
+                priority_services = ['YOUTUBE', 'TIKTOK', 'BYTEDANCE', 'GOOGLE', 'FACEBOOK', 'TWITTER', 
+                                   'TELEGRAM', 'APPLE', 'MICROSOFT', 'AMAZON', 'NETFLIX', 'SPOTIFY',
+                                   'ALIBABA', 'TENCENT', 'BAIDU', 'BILIBILI']
+                
+                for priority in priority_services:
+                    if priority in service_categories:
+                        return priority
+                        
+                # 返回第一个服务分类
+                return service_categories[0]
+            
+            # 如果没有服务分类，返回第一个匹配的分类
+            return matched_categories[0]
     
     def get_ip_country(self, ip: str) -> Optional[str]:
         """获取IP的国家/地区 - 使用GeoIP数据"""
