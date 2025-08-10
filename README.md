@@ -80,7 +80,7 @@ net-dog/
 ├── network_monitor.py       # 主程序
 ├── domain_resolver.py       # 域名解析引擎  
 ├── geosite_loader.py        # V2Ray数据加载器
-├── smart_ip_identifier.py   # IP智能识别
+├── unified_service_identifier.py # 统一服务识别器（整合IP识别和服务分类）
 ├── v2ray_dat_parser.py      # 数据解析器
 ├── install.sh              # 安装脚本
 ├── run.sh                  # 启动脚本

@@ -368,8 +368,8 @@ class NetworkMonitor:
     def _try_smart_ip_identification(self, ip: str) -> Optional[Tuple[str, str]]:
         """尝试智能IP识别"""
         try:
-            from smart_ip_identifier import smart_ip_identifier
-            provider, region, confidence = smart_ip_identifier.identify_ip(ip)
+            from unified_service_identifier import unified_service_identifier
+            provider, region, confidence = unified_service_identifier.identify_ip(ip)
             
             if confidence > 0.5:
                 return provider, region
@@ -490,16 +490,21 @@ class NetworkMonitor:
     
     def _create_virtual_devices(self, connections, current_devices, arp_devices):
         """创建虚拟设备（Clash VPN设备和直连设备）"""
-        vpn_connections = [conn for conn in connections if conn['local_ip'].startswith('28.0.0.')]
-        local_connections = [conn for conn in connections if conn['local_ip'].startswith('192.168.31.')]
+        # 从配置文件读取IP范围前缀
+        proxy_prefixes = [ip_range.split('/')[0].rsplit('.', 1)[0] + '.' for ip_range in self.config['network_settings']['proxy_ip_ranges']]
+        local_prefixes = [ip_range.split('/')[0].rsplit('.', 1)[0] + '.' for ip_range in self.config['network_settings']['local_ip_ranges']]
+        
+        vpn_connections = [conn for conn in connections if any(conn['local_ip'].startswith(prefix) for prefix in proxy_prefixes)]
+        local_connections = [conn for conn in connections if any(conn['local_ip'].startswith(prefix) for prefix in local_prefixes)]
         
         # 创建Clash设备（TUN模式）
         if vpn_connections:
             clash_key = "Clash设备"
             current_devices.add(clash_key)
             if clash_key not in self.device_stats:
+                proxy_ip_display = proxy_prefixes[0] + 'x' if proxy_prefixes else '28.0.0.x'
                 self.device_stats[clash_key] = {
-                    'ip': '28.0.0.x',
+                    'ip': proxy_ip_display,
                     'mac': 'virtual',
                     'hostname': f'Clash代理({len(vpn_connections)}个连接)',
                     'bytes_in': 0,
@@ -516,8 +521,9 @@ class NetworkMonitor:
             direct_key = "直连设备"
             current_devices.add(direct_key)
             if direct_key not in self.device_stats:
-                main_ip = '192.168.31.31'
-                hostname = 'mmini'
+                # 使用配置文件中的本地IP范围
+                main_ip = self.config['network_settings']['local_ip_ranges'][0].split('/')[0] if local_prefixes else '192.168.31.31'
+                hostname = 'local-device'
                 self.device_stats[direct_key] = {
                     'ip': f'{main_ip}(多端口)',
                     'mac': arp_devices.get(main_ip, 'unknown'),
@@ -570,9 +576,13 @@ class NetworkMonitor:
     
     def _determine_device_key(self, local_ip, current_devices, arp_devices):
         """确定连接对应的设备键"""
-        if local_ip.startswith('28.0.0.'):
+        # 从配置文件读取IP范围前缀
+        proxy_prefixes = [ip_range.split('/')[0].rsplit('.', 1)[0] + '.' for ip_range in self.config['network_settings']['proxy_ip_ranges']]
+        local_prefixes = [ip_range.split('/')[0].rsplit('.', 1)[0] + '.' for ip_range in self.config['network_settings']['local_ip_ranges']]
+        
+        if any(local_ip.startswith(prefix) for prefix in proxy_prefixes):
             return "Clash设备"
-        elif local_ip.startswith('192.168.31.'):
+        elif any(local_ip.startswith(prefix) for prefix in local_prefixes):
             return "直连设备"
         else:
             device_key = local_ip

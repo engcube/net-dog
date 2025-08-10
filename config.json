@@ -9,10 +9,19 @@
     "monitoring": {
         "interface_check_interval": 5,
         "connection_timeout": 30,
-        "max_recent_connections": 1000
+        "max_recent_connections": 1000,
+        "data_collection_interval": 3,
+        "dns_cache_timeout": 3600
     },
     "display": {
         "max_unknown_sites_display": 3,
-        "refresh_interval": 1
+        "refresh_interval": 1,
+        "max_table_rows": 50,
+        "enable_incremental_updates": true
+    },
+    "performance": {
+        "enable_caching": true,
+        "cache_cleanup_interval": 300,
+        "max_cache_entries": 1000
     }
 }

@@ -1,4 +1,205 @@
-# 网络监控工具架构分析
+# 🏗️ 系统架构文档
+
+## 📖 概述
+
+网络流量监控工具采用**模块化单一职责架构**，将复杂的网络监控功能分解为独立、可测试、可维护的组件。
+
+## 🎯 设计原则
+
+### 1. 单一职责原则 (SRP)
+每个模块都有明确的职责边界：
+- `TrafficAnalyzer` - 专注流量分析算法
+- `UIManager` - 专注界面渲染逻辑
+- `UnifiedServiceIdentifier` - 专注服务识别
+- `PerformanceMonitor` - 专注性能监控
+
+### 2. 依赖注入模式
+组件间通过依赖注入实现解耦：
+```python
+# 示例：性能监控器注入
+traffic_analyzer.set_performance_monitor(performance_monitor)
+ui_manager.set_performance_monitor(performance_monitor)
+```
+
+### 3. 配置驱动设计
+所有可变参数通过配置文件管理：
+```json
+{
+  "monitoring": {"data_collection_interval": 3},
+  "display": {"max_table_rows": 50},
+  "performance": {"enable_caching": true}
+}
+```
+
+## 🔧 核心组件架构
+
+### 主控制器 (NetworkMonitor)
+```
+NetworkMonitor
+├── 协调各组件工作
+├── 管理主事件循环  
+├── 处理用户输入
+└── 异常处理和恢复
+```
+
+**职责**：
+- 系统初始化和资源管理
+- 组件间通信协调
+- 生命周期管理
+
+### 流量分析器 (TrafficAnalyzer)
+```
+TrafficAnalyzer
+├── analyze_connections()     # 主分析入口
+├── _allocate_traffic()       # 核心分配算法
+├── _identify_devices()       # 设备识别逻辑
+└── _identify_connection_target() # 目标识别
+```
+
+**核心算法**：
+1. **连接分析算法**：解析系统网络连接，建立IP-设备映射
+2. **流量分配算法**：基于连接数比例分配流量（见算法说明）
+3. **设备聚合算法**：智能识别并聚合虚拟设备（VPN、代理）
+
+### UI管理器 (UIManager)  
+```
+UIManager
+├── create_main_layout()      # 主界面布局
+├── _create_devices_panel()   # 设备表格渲染
+├── _create_websites_panel()  # 网站表格渲染
+└── 渲染缓存优化机制
+```
+
+**渲染优化**：
+- 增量更新：仅在数据变化时重新渲染
+- 表格缓存：缓存渲染结果避免重复计算
+- 行数限制：大数据集自动分页显示
+
+## 🧮 核心算法详解
+
+### 流量分配算法
+
+**问题背景**：
+- 系统只能获取连接信息（IP:端口对），无法直接获取每个连接的实际流量
+- 需要将网络接口的总流量合理分配给各个设备和连接
+
+**算法原理**：
+```python
+def _allocate_traffic(connections, total_bytes_delta):
+    """
+    基于连接数比例的流量分配算法
+    
+    算法假设：
+    1. 每个连接的平均流量大致相等（简化假设）
+    2. 设备的流量与其连接数成正比
+    3. 长期统计下，该假设具有合理性
+    
+    算法步骤：
+    1. 统计每个设备的连接数
+    2. 计算连接数占总连接数的比例  
+    3. 按比例分配总流量增量
+    """
+    for device, device_connections in connections.items():
+        connection_count = len(device_connections)
+        ratio = connection_count / total_connections
+        
+        # 流量分配核心公式
+        device.bytes_in += total_bytes_in_delta * ratio
+        device.bytes_out += total_bytes_out_delta * ratio
+```
+
+**算法优势**：
+- ✅ 计算简单，性能高效
+- ✅ 不需要额外的系统权限
+- ✅ 跨平台兼容性好
+- ✅ 长期统计具有参考价值
+
+**算法局限**：
+- ❌ 无法反映单个大文件下载的真实流量
+- ❌ 对短期突发流量估算可能不准确
+- ❌ 依赖连接数，而非实际数据传输量
+
+**改进方向**：
+- 基于端口类型的权重调整（HTTP > DNS）
+- 考虑连接持续时间的权重系数  
+- 集成更精确的流量监控API（如果可用）
+
+### 服务识别算法
+
+**四层识别体系**：
+
+```python
+def identify_service_by_ip(ip):
+    """
+    多层服务识别算法
+    
+    第1层：IP段精确匹配（置信度：0.95）
+    - 基于已知服务的IP段数据库
+    - 例：8.8.8.8 -> Google DNS
+    
+    第2层：ASN启发式识别（置信度：0.85）  
+    - 基于自治系统号推断服务提供商
+    - 例：AS15169 -> Google服务
+    
+    第3层：IP模式匹配（置信度：0.75）
+    - 基于IP地址的模式规律
+    - 例：210.129.x.x -> 可能是Niconico
+    
+    第4层：DNS反查识别（置信度：0.60）
+    - 通过反向DNS查询获取域名
+    - 基于域名关键词匹配服务
+    """
+    # 实现见 unified_service_identifier.py
+```
+
+## 📊 性能优化设计
+
+### 缓存策略
+
+**多级缓存体系**：
+
+1. **渲染缓存** (ui_manager.py)
+   ```python
+   # 表格渲染结果缓存，避免重复计算
+   cache_key = f"{table_type}_{data_hash}"
+   cached_table = render_cache.get(cache_key)
+   ```
+
+2. **服务识别缓存** (unified_service_identifier.py)
+   ```python
+   # IP识别结果缓存，减少重复识别
+   cached_result = self.cache.get(ip)
+   ```
+
+### 性能监控
+
+**实时性能指标收集**：
+```python
+@monitor_performance("operation_name")
+def expensive_operation():
+    # 自动记录执行时间
+    # 超过阈值时报警
+    pass
+```
+
+**性能优化建议**：
+- CPU使用率 > 80% → 增加数据采集间隔
+- 内存使用率 > 85% → 启用缓存清理
+- UI渲染 > 500ms → 启用性能模式
+
+## 🎯 总结
+
+本架构通过**职责分离、依赖注入、配置驱动**等设计模式，实现了：
+
+- ✅ **高内聚低耦合**：每个模块职责明确，依赖关系清晰
+- ✅ **高性能**：多级缓存 + 增量渲染 + 性能监控
+- ✅ **高安全性**：隐私保护 + 权限控制 + 输入验证
+- ✅ **高可维护性**：完整测试 + 详细文档 + 模块化设计
+- ✅ **高扩展性**：插件化预留 + 配置化管理
+
+这是一个**企业级品质**的网络监控工具架构！
+
+---
 
 ## 🎯 项目当前状态
 

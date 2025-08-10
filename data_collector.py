@@ -51,8 +51,8 @@ class DarwinDataCollector(BaseDataCollector):
                     if match:
                         ip, mac = match.groups()
                         devices[ip] = mac
-        except:
-            pass
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            print(f"获取ARP表失败: {e}")
         return devices
     
     def get_connections(self) -> List[Dict]:
@@ -87,8 +87,8 @@ class DarwinDataCollector(BaseDataCollector):
                                     'foreign_port': foreign_port,
                                     'protocol': 'tcp'
                                 })
-        except:
-            pass
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
+            print(f"获取网络连接失败: {e}")
         return connections
     
     def get_interface_stats(self) -> Dict:
@@ -110,8 +110,8 @@ class DarwinDataCollector(BaseDataCollector):
                             }
                         except (ValueError, IndexError):
                             continue
-        except:
-            pass
+        except (subprocess.SubprocessError, OSError) as e:
+            print(f"获取接口统计失败: {e}")
         return stats
     
     def detect_local_network(self) -> str:
@@ -123,7 +123,8 @@ class DarwinDataCollector(BaseDataCollector):
                 gateway = gateway_match.group(1)
                 return '.'.join(gateway.split('.')[:-1]) + '.0/24'
             return '192.168.1.0/24'  # 默认值
-        except:
+        except (subprocess.SubprocessError, OSError, IndexError) as e:
+            print(f"检测本地网络失败: {e}")
             return '192.168.1.0/24'
 
 

@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import threading
 from v2ray_dat_parser import V2RayDatParser
 from utils import is_china_ip
+from unified_service_identifier import unified_service_identifier
 
 class GeositeLoader:
     def __init__(self, data_dir: str = "data"):
@@ -304,51 +305,58 @@ class GeositeLoader:
             return False
     
     def get_ip_country(self, ip: str) -> Optional[str]:
-        """获取IP的国家/地区 - 使用GeoIP数据，优先识别特殊服务"""
+        """获取IP的国家/地区 - 使用增强的服务识别器和GeoIP数据"""
         try:
             ip_obj = ipaddress.ip_address(ip)
             
-            # 定义特殊服务（优先级高于国家）
+            # 1. 使用统一的服务识别器 (最高优先级)
+            enhanced_service = unified_service_identifier.identify_service_by_ip(ip)
+            if enhanced_service:
+                return enhanced_service.name.lower()
+            
+            # 2. 检查原有GeoIP数据中的特殊服务
             special_services = ['CLOUDFLARE', 'GOOGLE', 'TELEGRAM', 'FACEBOOK', 'NETFLIX', 'TWITTER', 'FASTLY', 'CLOUDFRONT']
             
-            # 首先检查特殊服务
             for service in special_services:
                 if service in self.geoip_data:
                     for cidr in self.geoip_data[service]:
                         try:
                             if ip_obj in ipaddress.ip_network(cidr, strict=False):
-                                return service.lower()  # 服务名返回小写
+                                return service.lower()
                         except (ipaddress.AddressValueError, ValueError):
                             continue
             
-            # 然后检查国家代码
+            # 3. 检查国家代码
             for country, ip_ranges in self.geoip_data.items():
-                # 跳过已经检查过的特殊服务
                 if country in special_services:
                     continue
                     
                 for cidr in ip_ranges:
                     try:
                         if ip_obj in ipaddress.ip_network(cidr, strict=False):
-                            return country.lower()  # 国家代码返回小写
+                            return country.lower()
                     except (ipaddress.AddressValueError, ValueError):
                         continue
             
-            # 兜底：使用统一的中国IP检测
+            # 4. 兜底：使用统一的中国IP检测
             if is_china_ip(ip):
                 return 'cn'
             else:
-                return None  # 无法确定时返回None而不是假设为'us'
+                return None
             
         except Exception:
             return None
     
     def get_ip_service(self, ip: str) -> Optional[str]:
-        """根据IP获取服务名称（如Google、Telegram、Cloudflare等）"""
+        """根据IP获取服务名称 - 使用增强的服务识别器"""
         try:
-            ip_obj = ipaddress.ip_address(ip)
+            # 1. 使用统一的服务识别器 (优先级最高)
+            enhanced_service = unified_service_identifier.identify_service_by_ip(ip)
+            if enhanced_service:
+                return enhanced_service.name.lower()
             
-            # 检查所有特殊服务的IP范围（按重要性排序）
+            # 2. 回退到原有GeoIP数据查找
+            ip_obj = ipaddress.ip_address(ip)
             special_services = [
                 'cloudflare', 'google', 'telegram', 'facebook', 
                 'netflix', 'twitter', 'fastly', 'cloudfront'
