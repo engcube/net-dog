@@ -16,7 +16,7 @@ import socket
 # 导入增强的域名解析器和GeoSite数据
 from domain_resolver import domain_resolver
 from geosite_loader import geosite_loader
-from utils import is_china_ip
+from utils import is_china_ip, get_country_name
 from data_collector import create_data_collector
 
 try:
@@ -162,15 +162,29 @@ class NetworkMonitor:
         return domain_resolver.resolve_domain(ip)
     
     def _detect_ip_service(self, ip: str) -> Optional[Tuple[str, str]]:
-        """通过IP识别服务（如Telegram）"""
+        """通过IP识别服务（如Telegram、Google、Cloudflare等）"""
         try:
-            ip_service = geosite_loader.get_ip_service(ip)
-            if ip_service:
+            # 先检查国家识别是否为特殊服务
+            country = geosite_loader.get_ip_country(ip)
+            if country:
                 service_map = {
-                    'telegram': 'Telegram'
+                    'google': 'Google',
+                    'cloudflare': 'Cloudflare', 
+                    'telegram': 'Telegram',
+                    'facebook': 'Facebook',
+                    'netflix': 'Netflix',
+                    'twitter': 'Twitter',
+                    'fastly': 'Fastly',
+                    'cloudfront': 'CloudFront'
                 }
-                display_name = service_map.get(ip_service, ip_service.capitalize())
-                return display_name, '海外'
+                if country in service_map:
+                    return service_map[country], '海外服务'
+                    
+            # 备用方法：通过专门的服务识别
+            ip_service = geosite_loader.get_ip_service(ip)
+            if ip_service and ip_service in service_map:
+                return service_map[ip_service], '海外服务'
+                
         except Exception:
             pass
         return None
@@ -371,7 +385,29 @@ class NetworkMonitor:
             country = geosite_loader.get_ip_country(ip)
             if country == 'cn':
                 return '中国网站', '中国'
+            elif country:
+                # 检查是否为特殊服务
+                service_map = {
+                    'google': 'Google',
+                    'cloudflare': 'Cloudflare', 
+                    'telegram': 'Telegram',
+                    'facebook': 'Facebook',
+                    'netflix': 'Netflix',
+                    'twitter': 'Twitter',
+                    'fastly': 'Fastly',
+                    'cloudfront': 'CloudFront'
+                }
+                
+                if country in service_map:
+                    # 特殊服务显示
+                    service_name = service_map[country]
+                    return f'{service_name}服务', '海外服务'
+                else:
+                    # 普通国家显示具体国家名称
+                    country_name = get_country_name(country)
+                    return f'{country_name}网站', country_name
             else:
+                # 如果无法确定具体国家，仍显示"海外"
                 return '海外网站', '海外'
         except Exception:
             # 最终兜底

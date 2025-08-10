@@ -14,10 +14,17 @@ from dataclasses import dataclass
 
 
 @dataclass
+class DomainRule:
+    """域名规则"""
+    rule_type: str  # 'domain', 'full', 'keyword', 'regexp'
+    value: str      # 域名/关键词/正则表达式
+    attributes: List[str] = None  # @cn等属性
+
+@dataclass
 class GeositeEntry:
     """GeoSite条目"""
     category: str
-    domains: List[str]
+    domains: List[DomainRule]  # 改为存储规则对象
     domain_count: int
 
 
@@ -120,7 +127,7 @@ class V2RayDatParser:
             
         return None
     
-    def _parse_geosite_message(self, message_data: bytes) -> Tuple[Optional[str], List[str]]:
+    def _parse_geosite_message(self, message_data: bytes) -> Tuple[Optional[str], List[DomainRule]]:
         """解析geosite消息内容"""
         category = None
         domains = []
@@ -157,9 +164,9 @@ class V2RayDatParser:
                             pass
                     elif field_num == 2:
                         # 这是一个嵌套的域名规则消息
-                        domain = self._parse_domain_rule(field_data)
-                        if domain:
-                            domains.append(domain)
+                        domain_rule = self._parse_domain_rule_from_bytes(field_data)
+                        if domain_rule:
+                            domains.append(domain_rule)
                 else:
                     # 跳过其他类型的字段
                     offset += 1
@@ -169,8 +176,8 @@ class V2RayDatParser:
                 
         return category, domains
     
-    def _parse_domain_rule(self, rule_data: bytes) -> Optional[str]:
-        """解析域名规则"""
+    def _parse_domain_rule_from_bytes(self, rule_data: bytes) -> Optional[DomainRule]:
+        """从字节数据解析域名规则"""
         offset = 0
         domain = None
         
@@ -198,11 +205,11 @@ class V2RayDatParser:
                     
                     if field_num == 2:  # 域名字段
                         try:
-                            domain = field_data.decode('utf-8')
-                            # 清理域名格式
-                            domain = self._clean_domain(domain)
-                            if domain:
-                                return domain
+                            domain_str = field_data.decode('utf-8')
+                            # 使用新的规则解析逻辑
+                            domain_rule = self._parse_domain_rule(domain_str)
+                            if domain_rule:
+                                return domain_rule
                         except UnicodeDecodeError:
                             pass
                 else:
@@ -211,31 +218,54 @@ class V2RayDatParser:
             except Exception:
                 break
                 
-        return domain
+        return None
     
-    def _clean_domain(self, domain: str) -> Optional[str]:
-        """清理和验证域名格式"""
+    def _parse_domain_rule(self, domain: str) -> Optional[DomainRule]:
+        """解析域名规则，提取类型和值"""
         if not domain:
             return None
             
-        # 移除前缀标记
-        domain = re.sub(r'^[!~+]', '', domain)
+        original_domain = domain.strip()
+        attributes = []
         
-        # 移除正则表达式标记
-        domain = re.sub(r'^\$.*\$$', '', domain)
+        # 提取属性（如@cn）
+        if '@' in domain:
+            parts = domain.split('@')
+            domain = parts[0]
+            attributes = ['@' + attr for attr in parts[1:]]
         
-        # 移除路径部分
-        domain = domain.split('/')[0]
+        # 确定规则类型
+        rule_type = 'domain'  # 默认为domain类型（后缀匹配）
+        value = domain
         
-        # 验证域名格式
-        if '.' not in domain:
+        # 检查各种前缀标记
+        if domain.startswith('keyword:'):
+            rule_type = 'keyword'
+            value = domain[8:]  # 移除'keyword:'前缀
+        elif domain.startswith('regexp:'):
+            rule_type = 'regexp'
+            value = domain[7:]  # 移除'regexp:'前缀
+        elif domain.startswith('full:'):
+            rule_type = 'full'
+            value = domain[5:]  # 移除'full:'前缀
+        elif domain.startswith('domain:'):
+            rule_type = 'domain'
+            value = domain[7:]  # 移除'domain:'前缀
+        
+        # 处理其他前缀标记（如感叹号表示排除规则）
+        if value.startswith('!'):
+            # 排除规则暂时跳过，或者可以添加exclude属性
             return None
             
-        # 简单的域名验证
-        if re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', domain):
-            return domain.lower()
+        # 基本验证
+        if not value:
+            return None
             
-        return None
+        return DomainRule(
+            rule_type=rule_type,
+            value=value.lower(),
+            attributes=attributes if attributes else None
+        )
     
     def _read_varint(self, data: bytes, offset: int) -> Tuple[Optional[int], int]:
         """读取protobuf变长整数"""
@@ -379,20 +409,52 @@ class V2RayDatParser:
         return country_code, ip_ranges
     
     def _parse_ip_range(self, range_data: bytes) -> Optional[Tuple[str, int]]:
-        """解析IP范围"""
-        if len(range_data) < 5:  # 至少需要IP(4字节)+前缀(1字节)
+        """解析IP范围 - 按照V2Ray protobuf CIDR格式"""
+        if len(range_data) < 6:  # 至少需要IP字段(6字节)和前缀字段(2字节)
             return None
             
         try:
-            # IP地址通常在前4个字节
-            ip_bytes = range_data[:4]
-            ip_addr = ipaddress.IPv4Address(ip_bytes)
+            # 按protobuf wire format解析CIDR消息
+            offset = 0
+            ip_addr = None
+            prefix_len = None
             
-            # 前缀长度通常在第5个字节
-            if len(range_data) > 4:
-                prefix_len = range_data[4]
-                if 0 <= prefix_len <= 32:
-                    return (str(ip_addr), prefix_len)
+            while offset < len(range_data):
+                # 读取字段标签
+                if offset >= len(range_data):
+                    break
+                    
+                tag = range_data[offset]
+                field_num = tag >> 3
+                wire_type = tag & 0x7
+                offset += 1
+                
+                if field_num == 1 and wire_type == 2:  # IP字段 (bytes)
+                    # 读取长度
+                    if offset >= len(range_data):
+                        break
+                    length = range_data[offset]
+                    offset += 1
+                    
+                    # 读取IP数据
+                    if offset + length > len(range_data) or length != 4:
+                        break
+                    ip_bytes = range_data[offset:offset + length]
+                    ip_addr = ipaddress.IPv4Address(ip_bytes)
+                    offset += length
+                    
+                elif field_num == 2 and wire_type == 0:  # 前缀字段 (varint)
+                    # 读取前缀长度 (简单varint解析)
+                    if offset >= len(range_data):
+                        break
+                    prefix_len = range_data[offset]
+                    offset += 1
+                else:
+                    # 跳过未知字段
+                    offset += 1
+            
+            if ip_addr is not None and prefix_len is not None and 0 <= prefix_len <= 32:
+                return (str(ip_addr), prefix_len)
                     
         except Exception:
             pass
@@ -418,11 +480,17 @@ class V2RayDatParser:
         }
         
         entries = {}
-        for category, domains in fallback_categories.items():
+        for category, domain_strings in fallback_categories.items():
+            # 将字符串域名转换为DomainRule对象
+            domain_rules = []
+            for domain_str in domain_strings:
+                rule = DomainRule(rule_type='domain', value=domain_str.lower())
+                domain_rules.append(rule)
+            
             entries[category] = GeositeEntry(
                 category=category,
-                domains=domains,
-                domain_count=len(domains)
+                domains=domain_rules,
+                domain_count=len(domain_rules)
             )
             
         return entries

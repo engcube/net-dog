@@ -78,13 +78,9 @@ class GeositeLoader:
             # 使用新的完整V2Ray DAT解析器
             geosite_entries = self.parser.parse_geosite_dat(filepath)
             
-            # 转换为原有格式
-            geosite_data = {}
-            for category, entry in geosite_entries.items():
-                geosite_data[category] = entry.domains
-            
-            print(f"✅ 成功加载 {len(geosite_data)} 个分类，{sum(len(domains) for domains in geosite_data.values())} 个域名")
-            return geosite_data
+            # 直接返回GeositeEntry对象
+            print(f"✅ 成功加载 {len(geosite_entries)} 个分类，{sum(len(entry.domains) for entry in geosite_entries.values())} 个域名规则")
+            return geosite_entries
             
         except Exception as e:
             print(f"解析 geosite.dat 失败: {e}")
@@ -103,6 +99,27 @@ class GeositeLoader:
             for country_code, entry in geoip_entries.items():
                 cidr_list = []
                 for ip, prefix in entry.ip_ranges:
+                    # 过滤明显错误的IP段
+                    import ipaddress
+                    try:
+                        # 检查IP是否是私有地址
+                        ip_obj = ipaddress.ip_address(ip)
+                        if ip_obj.is_private:
+                            # 私有IP段不应该被分配给特定国家（静默跳过）
+                            continue
+                        
+                        # 对于小国家，过滤覆盖范围过大的IP段
+                        small_countries = ['AD', 'LI', 'MC', 'SM', 'VA', 'MT', 'CY']  
+                        if country_code in small_countries and prefix < 16:  # /16以下太大了
+                            continue
+                        
+                        # 对所有国家，过滤前缀长度过小的段（全球性错误）
+                        if prefix < 4:  # /4以下覆盖范围过大，基本不可能是单个国家
+                            continue
+                            
+                    except Exception:
+                        pass  # 忽略IP解析错误，继续处理
+                        
                     cidr_list.append(f"{ip}/{prefix}")
                 geoip_data[country_code] = cidr_list
             
@@ -119,18 +136,14 @@ class GeositeLoader:
             }
     
     def _build_lookup_cache(self):
-        """构建快速查找缓存 - 支持多分类映射"""
+        """构建快速查找缓存 - 新规则系统不需要预建索引"""
         with self.lock:
-            # 构建域名到分类列表的映射
-            self.domain_to_category.clear()
-            for category, domains in self.geosite_data.items():
-                for domain in domains:
-                    domain_lower = domain.lower()
-                    if domain_lower not in self.domain_to_category:
-                        self.domain_to_category[domain_lower] = []
-                    self.domain_to_category[domain_lower].append(category)
+            # 计算统计信息
+            total_rules = 0
+            for category, entry in self.geosite_data.items():
+                total_rules += len(entry.domains)
             
-            print(f"加载了 {len(self.domain_to_category)} 个域名映射")
+            print(f"加载了 {total_rules} 个域名规则")
             print(f"支持 {len(self.geosite_data)} 个网站分类")
     
     def _should_update(self) -> bool:
@@ -195,34 +208,48 @@ class GeositeLoader:
         """加载后备数据（预置最小数据集）"""
         print("使用预置数据集...")
         
-        self.geosite_data = {
-            'youtube': ['youtube.com', 'youtu.be', 'googlevideo.com', 'ytimg.com'],
-            'google': ['google.com', 'googleapis.com', 'gstatic.com'],
-            'facebook': ['facebook.com', 'instagram.com'],
-            'baidu': ['baidu.com'],
-            'tencent': ['qq.com', 'tencent.com'],
-            'alibaba': ['taobao.com', 'tmall.com', 'alipay.com']
+        # 导入DomainRule和GeositeEntry
+        from v2ray_dat_parser import DomainRule, GeositeEntry
+        
+        fallback_data = {
+            'YOUTUBE': ['youtube.com', 'youtu.be', 'googlevideo.com', 'ytimg.com'],
+            'GOOGLE': ['google.com', 'googleapis.com', 'gstatic.com'],
+            'FACEBOOK': ['facebook.com', 'instagram.com'],
+            'BAIDU': ['baidu.com'],
+            'TENCENT': ['qq.com', 'tencent.com'],
+            'ALIBABA': ['taobao.com', 'tmall.com', 'alipay.com']
         }
+        
+        self.geosite_data = {}
+        for category, domain_strings in fallback_data.items():
+            # 将字符串域名转换为DomainRule对象
+            domain_rules = []
+            for domain_str in domain_strings:
+                rule = DomainRule(rule_type='domain', value=domain_str.lower())
+                domain_rules.append(rule)
+            
+            self.geosite_data[category] = GeositeEntry(
+                category=category,
+                domains=domain_rules,
+                domain_count=len(domain_rules)
+            )
         
         self._build_lookup_cache()
     
     def get_domain_category(self, domain: str) -> Optional[str]:
-        """获取域名的分类 - 优先返回服务分类而非地理位置分类"""
+        """获取域名的分类 - 支持Domain/Full/Keyword/Regexp规则类型"""
         domain_lower = domain.lower()
         
         with self.lock:
             matched_categories = []
             
-            # 直接匹配
-            if domain_lower in self.domain_to_category:
-                matched_categories.extend(self.domain_to_category[domain_lower])
-            
-            # 子域名匹配
-            for registered_domain, categories in self.domain_to_category.items():
-                if domain_lower.endswith('.' + registered_domain) or domain_lower == registered_domain:
-                    for category in categories:
+            # 遍历所有分类，检查其域名规则
+            for category, entry in self.geosite_data.items():
+                for domain_rule in entry.domains:
+                    if self._match_domain_rule(domain_lower, domain_rule):
                         if category not in matched_categories:
                             matched_categories.append(category)
+                        break  # 一个分类匹配即可，进入下一个分类
             
             if not matched_categories:
                 return None
@@ -247,17 +274,63 @@ class GeositeLoader:
             # 如果没有服务分类，返回第一个匹配的分类
             return matched_categories[0]
     
+    def _match_domain_rule(self, domain: str, domain_rule) -> bool:
+        """根据规则类型匹配域名"""
+        try:
+            rule_type = domain_rule.rule_type
+            value = domain_rule.value
+            
+            if rule_type == 'full':
+                # 完全匹配
+                return domain == value
+            elif rule_type == 'keyword':
+                # 关键词匹配（包含）
+                return value in domain
+            elif rule_type == 'regexp':
+                # 正则表达式匹配
+                import re
+                try:
+                    return bool(re.search(value, domain))
+                except re.error:
+                    return False
+            elif rule_type == 'domain':
+                # 后缀匹配（默认）
+                return domain == value or domain.endswith('.' + value)
+            else:
+                # 未知规则类型，默认使用后缀匹配
+                return domain == value or domain.endswith('.' + value)
+                
+        except Exception:
+            return False
+    
     def get_ip_country(self, ip: str) -> Optional[str]:
-        """获取IP的国家/地区 - 使用GeoIP数据"""
+        """获取IP的国家/地区 - 使用GeoIP数据，优先识别特殊服务"""
         try:
             ip_obj = ipaddress.ip_address(ip)
             
-            # 检查所有GeoIP范围
+            # 定义特殊服务（优先级高于国家）
+            special_services = ['CLOUDFLARE', 'GOOGLE', 'TELEGRAM', 'FACEBOOK', 'NETFLIX', 'TWITTER', 'FASTLY', 'CLOUDFRONT']
+            
+            # 首先检查特殊服务
+            for service in special_services:
+                if service in self.geoip_data:
+                    for cidr in self.geoip_data[service]:
+                        try:
+                            if ip_obj in ipaddress.ip_network(cidr, strict=False):
+                                return service.lower()  # 服务名返回小写
+                        except (ipaddress.AddressValueError, ValueError):
+                            continue
+            
+            # 然后检查国家代码
             for country, ip_ranges in self.geoip_data.items():
+                # 跳过已经检查过的特殊服务
+                if country in special_services:
+                    continue
+                    
                 for cidr in ip_ranges:
                     try:
                         if ip_obj in ipaddress.ip_network(cidr, strict=False):
-                            return country
+                            return country.lower()  # 国家代码返回小写
                     except (ipaddress.AddressValueError, ValueError):
                         continue
             
@@ -271,18 +344,24 @@ class GeositeLoader:
             return None
     
     def get_ip_service(self, ip: str) -> Optional[str]:
-        """根据IP获取服务名称（如Telegram）"""
+        """根据IP获取服务名称（如Google、Telegram、Cloudflare等）"""
         try:
             ip_obj = ipaddress.ip_address(ip)
             
-            # 检查特殊服务的IP范围
-            if 'telegram' in self.geoip_data:
-                for cidr in self.geoip_data['telegram']:
-                    try:
-                        if ip_obj in ipaddress.ip_network(cidr, strict=False):
-                            return 'telegram'
-                    except (ipaddress.AddressValueError, ValueError):
-                        continue
+            # 检查所有特殊服务的IP范围（按重要性排序）
+            special_services = [
+                'cloudflare', 'google', 'telegram', 'facebook', 
+                'netflix', 'twitter', 'fastly', 'cloudfront'
+            ]
+            
+            for service in special_services:
+                if service.upper() in self.geoip_data:
+                    for cidr in self.geoip_data[service.upper()]:
+                        try:
+                            if ip_obj in ipaddress.ip_network(cidr, strict=False):
+                                return service
+                        except (ipaddress.AddressValueError, ValueError):
+                            continue
             
             return None
         except Exception:
